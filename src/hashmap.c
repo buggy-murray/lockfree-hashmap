@@ -22,6 +22,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <pthread.h>
+
+/* Thread-local epoch slot (set via hashmap_thread_register) */
+static __thread int tls_epoch_slot = -1;
 
 /* ──────────────────────────────────────────────────────────────────
  * Harris-style marked pointer helpers
@@ -105,7 +109,7 @@ static inline uint64_t make_so_dummy(size_t bucket)
  *
  * Also physically removes any marked (logically deleted) nodes encountered.
  */
-static bool list_find(struct hm_node *head, uint64_t so_key,
+static bool list_find(epoch_t *epoch, struct hm_node *head, uint64_t so_key,
                       _Atomic(uintptr_t) **out_prev, struct hm_node **out_curr)
 {
 retry:
@@ -126,8 +130,9 @@ retry:
                     memory_order_acq_rel, memory_order_acquire)) {
                 goto retry;  /* lost race, restart traversal */
             }
-            /* Successfully unlinked — free curr later (for now just skip) */
-            /* Note: in production, use epoch-based reclamation or hazard pointers */
+            /* Successfully unlinked — retire via EBR */
+            if (epoch)
+                epoch_retire(epoch, curr);
             curr = next;
             continue;
         }
@@ -175,7 +180,7 @@ static struct hm_node *list_insert(struct hm_node *head, struct hm_node *new_nod
         _Atomic(uintptr_t) *prev;
         struct hm_node *curr;
 
-        if (list_find(head, new_node->so_key, &prev, &curr)) {
+        if (list_find(NULL, head, new_node->so_key, &prev, &curr)) {
             /* Node with this so_key already exists */
             if (new_node->is_dummy) {
                 free(new_node);
@@ -221,7 +226,7 @@ static void *list_delete(struct hm_node *head, uint64_t so_key, uint64_t key)
         _Atomic(uintptr_t) *prev;
         struct hm_node *curr;
 
-        if (!list_find(head, so_key, &prev, &curr))
+        if (!list_find(NULL, head, so_key, &prev, &curr))
             return NULL;  /* not found */
 
         /* Verify it's the right key (not a dummy or hash collision) */
@@ -325,8 +330,8 @@ static void maybe_resize(hashmap_t *map)
             &map->buckets, &old_buckets, new_buckets,
             memory_order_acq_rel, memory_order_acquire)) {
         atomic_store_explicit(&map->size, new_cap, memory_order_release);
-        /* Old buckets will be leaked — in production, use epoch-based reclaim */
-        /* For now this is acceptable (resize is rare) */
+        /* Retire old bucket array via EBR */
+        epoch_retire(&map->epoch, old_buckets);
     } else {
         free(new_buckets);  /* another thread resized first */
     }
@@ -335,6 +340,11 @@ static void maybe_resize(hashmap_t *map)
 /* ──────────────────────────────────────────────────────────────────
  * Public API
  * ────────────────────────────────────────────────────────────────── */
+
+static void node_free_cb(void *ptr)
+{
+    free(ptr);
+}
 
 hashmap_t *hashmap_create(void)
 {
@@ -360,12 +370,31 @@ hashmap_t *hashmap_create(void)
     /* Bucket 0 points to head */
     buckets[0] = &map->head;
 
+    /* Initialize epoch-based reclamation */
+    epoch_init(&map->epoch, node_free_cb);
+
     return map;
+}
+
+int hashmap_thread_register(hashmap_t *map)
+{
+    int slot = epoch_register(&map->epoch);
+    tls_epoch_slot = slot;
+    return slot;
+}
+
+void hashmap_thread_unregister(hashmap_t *map, int slot)
+{
+    epoch_unregister(&map->epoch, slot);
+    tls_epoch_slot = -1;
 }
 
 void hashmap_destroy(hashmap_t *map)
 {
     if (!map) return;
+
+    /* Drain any pending retired nodes */
+    epoch_destroy(&map->epoch);
 
     /* Walk the list and free all nodes (except head, which is embedded) */
     uintptr_t tagged = atomic_load(&map->head.next);
@@ -384,6 +413,9 @@ void *hashmap_put(hashmap_t *map, uint64_t key, void *value)
 {
     if (key == 0 || !value) return NULL;
 
+    int slot = tls_epoch_slot;
+    if (slot >= 0) epoch_enter(&map->epoch, slot);
+
     uint64_t so_key = make_so_regular(key);
     size_t cap = atomic_load_explicit(&map->size, memory_order_acquire);
     size_t bucket = hash_key(key) & (cap - 1);
@@ -398,19 +430,25 @@ void *hashmap_put(hashmap_t *map, uint64_t key, void *value)
     _Atomic(uintptr_t) *prev;
     struct hm_node *curr;
 
-    if (list_find(bucket_head, so_key, &prev, &curr)) {
+    if (list_find(&map->epoch, bucket_head, so_key, &prev, &curr)) {
         if (curr && !curr->is_dummy && curr->key == key) {
             void *old = atomic_exchange_explicit(&curr->value, value,
                                                   memory_order_acq_rel);
+            if (slot >= 0) epoch_exit(&map->epoch, slot);
             return old;  /* updated existing */
         }
     }
 
     /* Insert new node — list_insert handles concurrent races */
     struct hm_node *node = node_alloc(key, so_key, value, false);
-    if (!node) return NULL;
+    if (!node) {
+        if (slot >= 0) epoch_exit(&map->epoch, slot);
+        return NULL;
+    }
 
     struct hm_node *result = list_insert(bucket_head, node);
+
+    if (slot >= 0) epoch_exit(&map->epoch, slot);
 
     if (result != node) {
         return NULL;
@@ -426,6 +464,9 @@ void *hashmap_get(hashmap_t *map, uint64_t key)
 {
     if (key == 0) return NULL;
 
+    int slot = tls_epoch_slot;
+    if (slot >= 0) epoch_enter(&map->epoch, slot);
+
     uint64_t so_key = make_so_regular(key);
     size_t cap = atomic_load_explicit(&map->size, memory_order_acquire);
     size_t bucket = hash_key(key) & (cap - 1);
@@ -439,18 +480,23 @@ void *hashmap_get(hashmap_t *map, uint64_t key)
     _Atomic(uintptr_t) *prev;
     struct hm_node *curr;
 
-    if (list_find(bucket_head, so_key, &prev, &curr)) {
+    void *result = NULL;
+    if (list_find(&map->epoch, bucket_head, so_key, &prev, &curr)) {
         if (curr && !curr->is_dummy && curr->key == key) {
-            return atomic_load_explicit(&curr->value, memory_order_acquire);
+            result = atomic_load_explicit(&curr->value, memory_order_acquire);
         }
     }
 
-    return NULL;
+    if (slot >= 0) epoch_exit(&map->epoch, slot);
+    return result;
 }
 
 void *hashmap_remove(hashmap_t *map, uint64_t key)
 {
     if (key == 0) return NULL;
+
+    int slot = tls_epoch_slot;
+    if (slot >= 0) epoch_enter(&map->epoch, slot);
 
     uint64_t so_key = make_so_regular(key);
     size_t cap = atomic_load_explicit(&map->size, memory_order_acquire);
@@ -462,6 +508,8 @@ void *hashmap_remove(hashmap_t *map, uint64_t key)
     if (!bucket_head) bucket_head = &map->head;
 
     void *val = list_delete(bucket_head, so_key, key);
+
+    if (slot >= 0) epoch_exit(&map->epoch, slot);
 
     if (val) {
         atomic_fetch_sub_explicit(&map->count, 1, memory_order_relaxed);

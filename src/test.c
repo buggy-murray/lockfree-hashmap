@@ -20,6 +20,7 @@ static void test_basic(void)
 
     hashmap_t *map = hashmap_create();
     assert(map != NULL);
+    int slot = hashmap_thread_register(map);
 
     int v1 = 42, v2 = 99, v3 = 7;
 
@@ -57,6 +58,7 @@ static void test_basic(void)
 
     printf("  remove: OK\n");
 
+    hashmap_thread_unregister(map, slot);
     hashmap_destroy(map);
     printf("  PASSED\n\n");
 }
@@ -67,6 +69,7 @@ static void test_many_keys(void)
 
     hashmap_t *map = hashmap_create();
     assert(map != NULL);
+    int slot = hashmap_thread_register(map);
 
     /* Insert 10000 keys — should trigger multiple resizes */
     int values[10000];
@@ -98,6 +101,7 @@ static void test_many_keys(void)
     }
     printf("  remaining 5000 verified\n");
 
+    hashmap_thread_unregister(map, slot);
     hashmap_destroy(map);
     printf("  PASSED\n\n");
 }
@@ -116,6 +120,7 @@ struct mt_args {
 static void *mt_worker(void *arg)
 {
     struct mt_args *a = (struct mt_args *)arg;
+    int slot = hashmap_thread_register(a->map);
     int base = a->thread_id * MT_OPS;
     int ok = 0;
 
@@ -140,6 +145,7 @@ static void *mt_worker(void *arg)
     }
 
     a->ok = ok;
+    hashmap_thread_unregister(a->map, slot);
     return NULL;
 }
 

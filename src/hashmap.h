@@ -21,6 +21,8 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 
+#include "epoch.h"
+
 /* Initial capacity (must be power of 2) */
 #define HASHMAP_INIT_CAP    16
 
@@ -50,7 +52,19 @@ typedef struct hashmap {
     _Atomic(size_t)            size;     /* Current capacity (power of 2) */
     _Atomic(size_t)            count;    /* Number of active elements    */
     struct hm_node             head;     /* List head sentinel           */
+    epoch_t                    epoch;    /* EBR for safe memory reclaim  */
 } hashmap_t;
+
+/*
+ * hashmap_thread_register — Register calling thread for safe memory reclamation.
+ * Must be called once per thread before any get/put/remove. Returns slot id.
+ */
+int hashmap_thread_register(hashmap_t *map);
+
+/*
+ * hashmap_thread_unregister — Unregister thread when done.
+ */
+void hashmap_thread_unregister(hashmap_t *map, int slot);
 
 /*
  * hashmap_create — Create a new hash map

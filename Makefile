@@ -8,7 +8,10 @@ all: $(BUILD)/test
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/test: src/hashmap.c src/test.c | $(BUILD)
+$(BUILD)/test: src/hashmap.c src/epoch.c src/test.c | $(BUILD)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD)/epoch_test: src/epoch.c src/epoch_test.c | $(BUILD)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 run: $(BUILD)/test
